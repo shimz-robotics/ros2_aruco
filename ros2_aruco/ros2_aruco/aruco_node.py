@@ -40,6 +40,11 @@ from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
+# OpenCV 4.7 以降で ArUco API が大幅に変更された。
+# バージョンを比較して新旧どちらの API を使うか決定する。
+_CV_VERSION = tuple(int(x) for x in cv2.__version__.split(".")[:2])
+_USE_NEW_ARUCO_API = _CV_VERSION >= (4, 7)
+
 
 class ArucoNode(rclpy.node.Node):
     def __init__(self):
@@ -145,9 +150,23 @@ class ArucoNode(rclpy.node.Node):
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        if _USE_NEW_ARUCO_API:
+            # OpenCV >= 4.7
+            self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+            self.aruco_parameters = cv2.aruco.DetectorParameters()
+            self.aruco_detector = cv2.aruco.ArucoDetector(
+                self.aruco_dictionary, self.aruco_parameters
+            )
+        else:
+            # OpenCV < 4.7
+            self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
+            self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+            self.aruco_detector = None
+
         self.bridge = CvBridge()
+        self.get_logger().info(
+            f"OpenCV {cv2.__version__} — using {'new' if _USE_NEW_ARUCO_API else 'legacy'} ArUco API"
+        )
 
     def info_callback(self, info_msg):
         self.info_msg = info_msg
@@ -174,36 +193,83 @@ class ArucoNode(rclpy.node.Node):
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
 
-        corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-            cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
-        )
+        # --- マーカー検出 ---
+        if _USE_NEW_ARUCO_API:
+            corners, marker_ids, rejected = self.aruco_detector.detectMarkers(
+                cv_image
+            )
+        else:
+            corners, marker_ids, rejected = cv2.aruco.detectMarkers(
+                cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
+            )
+
         if marker_ids is not None:
-            if cv2.__version__ > "4.0.0":
+            # --- 姿勢推定 ---
+            if _USE_NEW_ARUCO_API:
+                # OpenCV >= 4.7: estimatePoseSingleMarkers は 4.8 で削除された
+                # ため、solvePnP で代替する
+                half = self.marker_size / 2.0
+                obj_points = np.array(
+                    [
+                        [-half, half, 0.0],
+                        [half, half, 0.0],
+                        [half, -half, 0.0],
+                        [-half, -half, 0.0],
+                    ],
+                    dtype=np.float64,
+                )
+                for i, marker_id in enumerate(marker_ids):
+                    success, rvec, tvec = cv2.solvePnP(
+                        obj_points,
+                        corners[i],
+                        self.intrinsic_mat,
+                        self.distortion,
+                    )
+                    if not success:
+                        continue
+
+                    pose = Pose()
+                    pose.position.x = float(tvec[0][0])
+                    pose.position.y = float(tvec[1][0])
+                    pose.position.z = float(tvec[2][0])
+
+                    rot_matrix = np.eye(4)
+                    rot_matrix[0:3, 0:3] = cv2.Rodrigues(rvec)[0]
+                    quat = tf_transformations.quaternion_from_matrix(rot_matrix)
+
+                    pose.orientation.x = quat[0]
+                    pose.orientation.y = quat[1]
+                    pose.orientation.z = quat[2]
+                    pose.orientation.w = quat[3]
+
+                    pose_array.poses.append(pose)
+                    markers.poses.append(pose)
+                    markers.marker_ids.append(marker_id[0])
+            else:
+                # OpenCV < 4.7: 従来の estimatePoseSingleMarkers を使用
                 rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
                     corners, self.marker_size, self.intrinsic_mat, self.distortion
                 )
-            else:
-                rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
-            for i, marker_id in enumerate(marker_ids):
-                pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
+                for i, marker_id in enumerate(marker_ids):
+                    pose = Pose()
+                    pose.position.x = tvecs[i][0][0]
+                    pose.position.y = tvecs[i][0][1]
+                    pose.position.z = tvecs[i][0][2]
 
-                rot_matrix = np.eye(4)
-                rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
-                quat = tf_transformations.quaternion_from_matrix(rot_matrix)
+                    rot_matrix = np.eye(4)
+                    rot_matrix[0:3, 0:3] = cv2.Rodrigues(
+                        np.array(rvecs[i][0])
+                    )[0]
+                    quat = tf_transformations.quaternion_from_matrix(rot_matrix)
 
-                pose.orientation.x = quat[0]
-                pose.orientation.y = quat[1]
-                pose.orientation.z = quat[2]
-                pose.orientation.w = quat[3]
+                    pose.orientation.x = quat[0]
+                    pose.orientation.y = quat[1]
+                    pose.orientation.z = quat[2]
+                    pose.orientation.w = quat[3]
 
-                pose_array.poses.append(pose)
-                markers.poses.append(pose)
-                markers.marker_ids.append(marker_id[0])
+                    pose_array.poses.append(pose)
+                    markers.poses.append(pose)
+                    markers.marker_ids.append(marker_id[0])
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
