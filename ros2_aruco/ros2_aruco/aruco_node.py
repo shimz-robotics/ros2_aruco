@@ -164,6 +164,11 @@ class ArucoNode(rclpy.node.Node):
             self.aruco_detector = None
 
         self.bridge = CvBridge()
+
+        # Diagnostics counters
+        self._img_count = 0
+        self._detect_count = 0
+
         self.get_logger().info(
             f"OpenCV {cv2.__version__} — using {'new' if _USE_NEW_ARUCO_API else 'legacy'} ArUco API"
         )
@@ -172,13 +177,16 @@ class ArucoNode(rclpy.node.Node):
         self.info_msg = info_msg
         self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
         self.distortion = np.array(self.info_msg.d)
+        self.get_logger().info("Camera info received. Intrinsic matrix and distortion coefficients loaded.")
         # Assume that camera parameters will remain the same...
         self.destroy_subscription(self.info_sub)
 
     def image_callback(self, img_msg):
         if self.info_msg is None:
-            self.get_logger().warn("No camera info has been received!")
+            self.get_logger().warn("No camera info has been received!", throttle_duration_sec=5.0)
             return
+
+        self._img_count += 1
 
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
         markers = ArucoMarkers()
@@ -271,8 +279,16 @@ class ArucoNode(rclpy.node.Node):
                     markers.poses.append(pose)
                     markers.marker_ids.append(marker_id[0])
 
+            self._detect_count += len(markers.marker_ids)
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
+
+        # Periodic diagnostics (every 100 frames)
+        if self._img_count % 100 == 0:
+            self.get_logger().info(
+                f"[diag] Processed {self._img_count} frames, "
+                f"detected markers in total: {self._detect_count}"
+            )
 
 
 def main():
